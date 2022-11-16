@@ -6,10 +6,12 @@ import numpy as np
 import math
 import pyaudio
 import json
+import librosa
 import scipy.fft
 import matplotlib.pyplot as plt
 import time
 from pynput import keyboard
+from scipy.signal import find_peaks
 
 ######################################################################
 # mic_to_mouse.py - control the mouse using audio from the microphone
@@ -19,41 +21,19 @@ from pynput import keyboard
 # Codes are partially based on: https://github.com/mzucker/python-tuner
 ######################################################################
 
-# ref base frequency of a melodica
-number_to_freq_dict = {
-    60: 262.3,
-    61: 277.2,
-    62: 292.3,
-    63: 309.8,
-    64: 329.3,
-    65: 348.1,
-    66: 368.4,
-    67: 388.0,
-    68: 411.1,
-    69: 437.3,
-    70: 464.9,
-    71: 494.3,
-    72: 521.1,
-    73: 553.3,
-    74: 586.0,
-    75: 620.7,
-    76: 653.8,
-    77: 688.4,
-    78: 735.0,
-    79: 776.5,
-    80: 824.7,
-    81: 873.3,
-    82: 928.0,
-    83: 988.3,
-    84: 1042.0
-}
 
-# amps(weights) of each harmonics of a melodica
-weights = [0.8, 0.4, 1.0, 0.7, 1.1, 0.9, 1.4, 0.2, 0.3, 0.1]
 
-def freq_to_number(f): return 69 + 12 * np.log2(f / 440.0)
+# volume threshold of detecting
+amp_threshold_on = 50000
+amp_threshold_off = 30000
 
-def number_to_freq(n): return 440 * 2.0 ** ((n - 69) / 12.0)
+# 440.0 Hz (+0.0) by default
+tune= +0.0
+
+
+def freq_to_number(f): return 69 + 12 * np.log2(f / 440.0+tune)
+
+def number_to_freq(n): return (440+tune) * 2.0 ** ((n - 69) / 12.0)
 
 def note_name(n): return NOTE_NAMES[n % 12] + str(math.floor(n / 12) - 1)
 
@@ -62,6 +42,7 @@ def note_to_fftbin(n): return number_to_freq(n) / FREQ_STEP
 def index_to_freq(index, imin, FREQ_STEP): return (index + imin) * FREQ_STEP
 
 def freq_to_index(freq, imin, FREQ_STEP): return round(freq / FREQ_STEP - imin)
+
 
 #
 def listen_keyboard(params):
@@ -100,25 +81,6 @@ def read_features_from_file(path):
     f.close()
     return s
 
-# given frequencie feature of notes and current fft, find the note that best fit current fft
-# freq_indexes: list of the first k freq indexes(in fft) for a note
-# weights: list of weight corresponding to the freqs
-def note_score(fft,freq_indexes,weights):
-    scores = []
-    for i in range(0,len(freq_indexes)):
-        if freq_indexes[i]>=len(fft):
-            print("warning:",freq_indexes[i],"larger than fft size")
-            break
-        scores.append(abs(fft[freq_indexes[i]])*weights[i])
-    return np.mean(scores)
-
-# calc the first k harmonic frequencies of a note
-def harms_of_note(note_index,k):
-    harms = []
-    base = number_to_freq_dict[note_index]
-    for i in range(1,k+1):
-        harms.append(base*i)
-    return harms
 
 
 if __name__ == '__main__':
@@ -126,8 +88,8 @@ if __name__ == '__main__':
     NOTE_MIN = 60 # C5, the lowest note you want to detect
     NOTE_MAX = 84  # C7, the highest note you want to detect
     FSAMP = 22050 # Sampling frequency in Hz
-    FRAME_SIZE = 128  # How many samples per frame
-    FRAMES_PER_FFT = 8  # FFT takes average across how many frames
+    FRAME_SIZE = 256 # How many samples per frame
+    FRAMES_PER_FFT = 16  # FFT takes average across how many frames
     SAMPLES_PER_FFT = FRAME_SIZE * FRAMES_PER_FFT
     FREQ_STEP = float(FSAMP) / SAMPLES_PER_FFT
 
@@ -136,13 +98,12 @@ if __name__ == '__main__':
     print(NOTE_NAMES)
 
     print("note_to_fftbin(60)",note_to_fftbin(60))
+    print("freq_to_index(261.63)",freq_to_index(261.63,1,FREQ_STEP))
 
-    imin = max(0, int(np.floor(note_to_fftbin(NOTE_MIN-1))))
-    imax = min(SAMPLES_PER_FFT, int(np.ceil(note_to_fftbin(NOTE_MAX+1))))
+    freq_index_min = freq_to_index(number_to_freq(NOTE_MIN), 0, FREQ_STEP)
+    freq_index_max = freq_to_index(number_to_freq(NOTE_MAX), 0, FREQ_STEP)
 
-    print("imin",imin,"imax",imax)
-
-    buf = np.zeros(SAMPLES_PER_FFT, dtype=np.float32)
+    buf = np.zeros(SAMPLES_PER_FFT, dtype=np.int16)
     num_frames = 0
 
     # Initialize audio device
@@ -173,14 +134,6 @@ if __name__ == '__main__':
     # status of the program, can be 1(running), 0(pause) and -1(trigger exit)
     active = 1
 
-    # build the freqs list of each note, which saves the index of each harmonic frequency in FFT window (starting from NOTE_MIN)
-    note_list = range(NOTE_MIN,NOTE_MAX+1)
-    freqs_dict = {}
-    for note in note_list:
-        freqs_dict[note] = []
-        for freq in harms_of_note(note,10):
-            index = freq_to_index(freq,imin,FREQ_STEP)
-            freqs_dict[note].append(index)
 
     last_scan_time = time.time()
 
@@ -205,9 +158,9 @@ if __name__ == '__main__':
 
         # Run the FFT on the windowed buffer
         fft = scipy.fft.fft(buf * window)
-
+        absfft = np.abs(fft)
         # used as the volume of input
-        amp = max(np.abs(fft[imin:imax]))
+        amp = max(absfft[freq_index_min:freq_index_max*5])
 
         # Console output once we have a full buffer
         num_frames += 1
@@ -218,23 +171,30 @@ if __name__ == '__main__':
 
         if num_frames >= FRAMES_PER_FFT:
 
-            # volume larger than 50000 will trigger the note detecting and mouse control
-            if (amp > 50000):
-                scores = []
-                # calc the score of each note
-                for note_index in note_list:
-                    score = note_score(fft[imin:],freqs_dict[note_index],weights)
-                    scores.append(score)
+            # volume larger than 50000, trigger the note detecting and mouse control
+            if (amp > amp_threshold_on):
 
-                scores_index = np.array(scores).argmax()
-                best_fit_note_index = note_list[scores_index]
-                # print(note_name(best_fit_note_index), amp, scores[scores_index])
+                peaks = find_peaks(absfft[:FRAME_SIZE*3],prominence=amp/10)[0]
 
-                mouse.position = (mouse.position[0], math.floor(map_input(best_fit_note_index,input_range=[NOTE_MIN,NOTE_MAX],output_y_range=[983,171])))
+                peaks = [peak for peak in peaks if (peak < freq_index_max and peak >= freq_index_min - 1)]
+
+                if len(peaks)==0: continue
+
+                note_detected = round(freq_to_number(index_to_freq(peaks[0],0,FREQ_STEP)))
+                print(note_name(note_detected),amp)
+
+                # DEBUG
+                # if(note_name(note_detected)=='E4'):
+                #     plt.plot(absfft[:FRAME_SIZE*3])
+                #     plt.show()
+
+
+                # the mouse will move between (983,171) for my full screen resolution, output_y_range for your resolution
+                mouse.position = (mouse.position[0], math.floor(map_input(note_detected,input_range=[NOTE_MIN,NOTE_MAX],output_y_range=[983,171])))
                 mouse.press(Button.left)  # press left button of the mouse
 
-            # volume smaller than 20000 will release the mouse
-            if (amp < 20000):
+            # volume smaller than 20000, release the mouse
+            if (amp < amp_threshold_off):
                 mouse.release(Button.left)  # release left button of the mouse
 
 
